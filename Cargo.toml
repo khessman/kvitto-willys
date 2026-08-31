@@ -1,0 +1,23 @@
+[package]
+name = "kvitto-willys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Willys receipts via BankID, as a ReceiptSource"
+
+[dependencies]
+kvitto-core = { path = "../kvitto-core" }
+
+async-trait = "0.1"
+base64 = "0.22"
+chromiumoxide = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "time"] }
+tracing = "0.1"
+url = "2"
+pdf-extract = "0.12.0"
