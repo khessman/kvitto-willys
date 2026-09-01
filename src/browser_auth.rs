@@ -25,9 +25,9 @@
 //! clicks; real `Input.dispatchMouseEvent` clicks hung outright on the
 //! cookie-consent button in this environment).
 
-use crate::client::WillysHttp;
+use crate::client::AxfoodHttp;
 use crate::endpoints as ep;
-use crate::session::{Cookie, WillysSession};
+use crate::session::{Cookie, AxfoodSession};
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
@@ -36,6 +36,10 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Ceiling for the backoff below — repeated failures (WAF blocking even the
+/// page's own unrelated background calls, seen live 2026-08-31) shouldn't
+/// turn into a tight 2s hammer for the rest of `LOGIN_TIMEOUT`.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(20);
 /// Human BankID interaction takes a while — the phone has to come out.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -55,11 +59,11 @@ struct CollectResponse {
 }
 
 pub struct BrowserLogin<'a> {
-    pub http: &'a WillysHttp,
+    pub http: &'a AxfoodHttp,
 }
 
 impl<'a> BrowserLogin<'a> {
-    pub async fn run(&self, ui: &dyn AuthUi) -> Result<WillysSession> {
+    pub async fn run(&self, ui: &dyn AuthUi) -> Result<AxfoodSession> {
         ui.status("Startar BankID-order...");
         let (order, csrf) = self.create_order().await?;
 
@@ -106,16 +110,21 @@ impl<'a> BrowserLogin<'a> {
         order_ref: &str,
         csrf: &str,
         ui: &dyn AuthUi,
-    ) -> Result<WillysSession> {
+    ) -> Result<AxfoodSession> {
         let profile_dir = std::env::temp_dir().join(format!(
             "kvittokartan-browser-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
         ));
-        // Headless: nothing left to click since the whole flow moved to
-        // plain fetch() calls (see module docs) — no UI a human ever needs
-        // to see, so no window needs to open.
-        let mut builder = BrowserConfig::builder().user_data_dir(profile_dir);
+        // Not headless: nothing left to click since the whole flow moved to
+        // plain fetch() calls (see module docs), but `--headless` itself is
+        // one of the stronger bot-detection signals modern WAFs check for
+        // (navigator.webdriver, headless-only JS quirks) — Hemköp's
+        // collect-login started silently blackholing under headless mode
+        // (confirmed live 2026-09-01: even the site's own background calls
+        // got WAF-blocked). A real, visible Chromium window is otherwise
+        // identical automation, just without that specific tell.
+        let mut builder = BrowserConfig::builder().with_head().user_data_dir(profile_dir);
         if let Some(bin) = find_browser_binary() {
             builder = builder.chrome_executable(bin);
         }
@@ -138,9 +147,9 @@ impl<'a> BrowserLogin<'a> {
         order_ref: &str,
         csrf: &str,
         ui: &dyn AuthUi,
-    ) -> Result<WillysSession> {
+    ) -> Result<AxfoodSession> {
         let page = browser
-            .new_page(ep::BASE)
+            .new_page(self.http.chain.base())
             .await
             .map_err(|e| Error::Auth(format!("could not open a page: {e}")))?;
 
@@ -173,37 +182,72 @@ impl<'a> BrowserLogin<'a> {
                const body = await r.json(); \
                return {{status: r.status, body}}; \
              }})()",
-            base = ep::BASE,
+            base = self.http.chain.base(),
             path = ep::BANKID_COLLECT,
         );
 
         let started = std::time::Instant::now();
+        // Doubles on every failed poll (timeout, non-200, bad body — see the
+        // three `continue`s below), resets to `POLL_INTERVAL` the moment a
+        // poll actually decodes as a real collect-login response (PENDING or
+        // COMPLETE). Backing off instead of hammering every 2s matters here:
+        // a WAF that's already flagging this session only gets more
+        // suspicious of tight, regular request timing.
+        let mut poll_interval = POLL_INTERVAL;
         loop {
             if started.elapsed() > LOGIN_TIMEOUT {
                 return Err(Error::Auth("inloggningen tog för lång tid".into()));
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(poll_interval).await;
 
             #[derive(Deserialize)]
             struct Wrapped {
                 status: u16,
                 body: serde_json::Value,
             }
-            let wrapped: Wrapped = match page
-                .evaluate(collect_js.as_str())
-                .await
-                .ok()
-                .and_then(|r| r.into_value::<Wrapped>().ok())
-            {
-                Some(w) => w,
-                None => continue, // transient — page not ready, network blip, etc.
+            let eval_result = page.evaluate(collect_js.as_str()).await;
+            let wrapped: Wrapped = match &eval_result {
+                Ok(r) => match r.clone().into_value::<Wrapped>() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!(
+                            "{}: collect-login poll: evaluate() result didn't decode as {{status,body}}: {e} (raw: {:?})",
+                            self.http.chain.cookie_domain(),
+                            r.value(),
+                        );
+                        poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("{}: collect-login poll: page.evaluate failed: {e}", self.http.chain.cookie_domain());
+                    poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
+                    continue; // transient — page not ready, network blip, etc.
+                }
             };
             if wrapped.status != 200 {
+                tracing::warn!(
+                    "{}: collect-login poll: HTTP {} — body: {}",
+                    self.http.chain.cookie_domain(),
+                    wrapped.status,
+                    wrapped.body,
+                );
+                poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
                 continue;
             }
-            let Ok(collect) = serde_json::from_value::<CollectResponse>(wrapped.body) else {
-                continue;
+            let collect = match serde_json::from_value::<CollectResponse>(wrapped.body.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "{}: collect-login poll: 200 body didn't decode as CollectResponse: {e} (raw: {})",
+                        self.http.chain.cookie_domain(),
+                        wrapped.body,
+                    );
+                    poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
+                    continue;
+                }
             };
+            poll_interval = POLL_INTERVAL; // a real response — WAF isn't (currently) in the way
 
             match collect.status.as_str() {
                 "COMPLETE" => {
@@ -214,7 +258,7 @@ impl<'a> BrowserLogin<'a> {
                         .map_err(|e| Error::Auth(format!("could not read cookies: {e}")))?;
                     let cookies: Vec<Cookie> = raw_cookies
                         .into_iter()
-                        .filter(|c| c.domain.contains("willys.se"))
+                        .filter(|c| c.domain.contains(self.http.chain.cookie_domain()))
                         .map(|c| Cookie {
                             name: c.name,
                             value: c.value,
@@ -222,7 +266,7 @@ impl<'a> BrowserLogin<'a> {
                             path: c.path,
                         })
                         .collect();
-                    return Ok(WillysSession {
+                    return Ok(AxfoodSession {
                         cookies,
                         csrf_token: Some(csrf.to_string()),
                         expires_at: None,

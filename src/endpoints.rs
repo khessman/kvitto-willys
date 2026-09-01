@@ -1,8 +1,8 @@
-//! Every URL and field name Willys can change under us, in one file.
-//! Filled in from a HAR capture of a real BankID login (2026-08-29). Receipt
-//! endpoints are still unknown — no receipt exists on the account yet.
-
-pub const BASE: &str = "https://www.willys.se";
+//! Every URL and field name Axfood can change under us, in one file.
+//! Filled in from a HAR capture of a real Willys BankID login (2026-08-29)
+//! and confirmed identical against hemkop.se (2026-08-31) — same Hybris
+//! instance behind both domains. The domain itself lives in `Chain::base`,
+//! not here; everything below is path-only and shared across chains.
 
 // --- CSRF ---------------------------------------------------------------
 // Fetched proactively before the first mutating call, not reactively on 401:
@@ -52,14 +52,12 @@ pub const BANKID_COLLECT: &str = "/axfood/rest/v1/checkout/bankid/collect-login"
 /// params, since the core never interprets it.
 pub const RECEIPTS_LIST: &str = "/axfood/rest/v1/account/pagedOrderBonusCombined";
 
-/// GET — confirmed: a PDF (see `parse.rs`), not JSON. `{id}` is
-/// `digitalReceiptReference` verbatim (already contains slashes/colons —
-/// URL-encode when substituting). Query params, all from the same
-/// `pagedOrderBonusCombined` entry: `date` (from `bookingDate`, as
-/// `YYYY-MM-DD`), `storeId` (`storeCustomerId`), `source` (`receiptSource`),
-/// `memberCardNumber`.
-pub const RECEIPT_DETAIL: &str =
-    "/axfood/rest/order/orders/digitalreceipt/{id}?date={date}&storeId={storeId}&source={source}&memberCardNumber={memberCardNumber}";
+/// GET — confirmed: a PDF (see `parse.rs`), not JSON. Base path only;
+/// `source.rs::fetch` builds the full URL (reference path segment +
+/// `date`/`storeId`/`source`/`memberCardNumber` query params, all from the
+/// same `pagedOrderBonusCombined` entry) so it can URL-encode the reference
+/// properly — it contains slashes and colons.
+pub const RECEIPT_DETAIL: &str = "/axfood/rest/order/orders/digitalreceipt";
 
 // --- Headers ----------------------------------------------------------
 

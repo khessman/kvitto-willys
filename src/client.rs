@@ -1,5 +1,6 @@
+use crate::chain::Chain;
 use crate::endpoints as ep;
-use crate::session::{Cookie, WillysSession};
+use crate::session::{Cookie, AxfoodSession};
 use kvitto_core::{Error, Result};
 use reqwest::cookie::CookieStore;
 use std::sync::Arc;
@@ -11,18 +12,19 @@ use std::time::Duration;
 ///
 /// Cookies are held in an explicit `reqwest::cookie::Jar` rather than the
 /// client builder's opaque built-in store, because `auth::finish` needs to
-/// read them back out afterwards to build a `WillysSession` — the whole
+/// read them back out afterwards to build a `AxfoodSession` — the whole
 /// point of `MemorySessionStore` is that a session survives without ever
 /// touching disk, so it has to come from somewhere introspectable.
-pub struct WillysHttp {
+pub struct AxfoodHttp {
+    pub chain: Chain,
     pub http: reqwest::Client,
     jar: Arc<reqwest::cookie::Jar>,
-    pub session: Option<WillysSession>,
+    pub session: Option<AxfoodSession>,
     last_call: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
-impl WillysHttp {
-    pub fn new() -> Result<Self> {
+impl AxfoodHttp {
+    pub fn new(chain: Chain) -> Result<Self> {
         let jar = Arc::new(reqwest::cookie::Jar::default());
         let http = reqwest::Client::builder()
             .cookie_provider(jar.clone())
@@ -30,26 +32,27 @@ impl WillysHttp {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(Self { http, jar, session: None, last_call: std::sync::Mutex::new(None) })
+        Ok(Self { chain, http, jar, session: None, last_call: std::sync::Mutex::new(None) })
     }
 
     /// Restore cookies from a previously saved session, e.g. after loading
     /// one from `SessionStore` instead of running BankID again.
-    pub fn restore(&self, session: &WillysSession) {
-        let url: reqwest::Url = ep::BASE.parse().expect("BASE is a valid URL");
+    pub fn restore(&self, session: &AxfoodSession) {
+        let url: reqwest::Url = self.chain.base().parse().expect("chain base is a valid URL");
         for c in &session.cookies {
             let set_cookie = format!("{}={}; Domain={}; Path={}", c.name, c.value, c.domain, c.path);
             self.jar.add_cookie_str(&set_cookie, &url);
         }
     }
 
-    /// Everything the jar currently holds for `BASE`, flattened into the
-    /// name/value pairs `WillysSession` stores. Domain/path are not
-    /// recoverable from `Jar::cookies` (it only serialises a `Cookie:`
-    /// header value), so they're filled in as `BASE`'s own — harmless, since
-    /// `WillysSession::cookie_header` only ever re-joins name=value pairs.
+    /// Everything the jar currently holds for the chain's base URL,
+    /// flattened into the name/value pairs `AxfoodSession` stores.
+    /// Domain/path are not recoverable from `Jar::cookies` (it only
+    /// serialises a `Cookie:` header value), so they're filled in as the
+    /// base URL's own host — harmless, since `AxfoodSession::cookie_header`
+    /// only ever re-joins name=value pairs.
     pub fn session_cookies(&self) -> Vec<Cookie> {
-        let url: reqwest::Url = ep::BASE.parse().expect("BASE is a valid URL");
+        let url: reqwest::Url = self.chain.base().parse().expect("chain base is a valid URL");
         let domain = url.host_str().unwrap_or_default().to_string();
         match self.jar.cookies(&url) {
             Some(header) => header
@@ -107,11 +110,11 @@ impl WillysHttp {
     /// bot filter would 503 a request the app itself would have accepted —
     /// TLS fingerprinting could still block it regardless, but this is the
     /// cheap thing to rule out first.
-    fn browser_headers(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn browser_headers(rb: reqwest::RequestBuilder, base: &str) -> reqwest::RequestBuilder {
         rb.header("accept", "*/*")
             .header("accept-language", "en-US,en;q=0.9")
-            .header("origin", ep::BASE)
-            .header("referer", format!("{}/", ep::BASE))
+            .header("origin", base)
+            .header("referer", format!("{base}/"))
             .header("sec-fetch-dest", "empty")
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-site", "same-origin")
@@ -132,7 +135,7 @@ impl WillysHttp {
         self.throttle();
         let rb = self
             .http
-            .get(ep::BASE)
+            .get(self.chain.base())
             .header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("accept-language", "en-US,en;q=0.9")
             .header("sec-fetch-dest", "document")
@@ -151,8 +154,11 @@ impl WillysHttp {
         path: &str,
     ) -> Result<T> {
         self.throttle();
-        let rb = Self::browser_headers(self.http.get(format!("{}{}", ep::BASE, path)))
-            .header(ep::REQUESTED_WITH, "XMLHttpRequest");
+        let rb = Self::browser_headers(
+            self.http.get(format!("{}{}", self.chain.base(), path)),
+            self.chain.base(),
+        )
+        .header(ep::REQUESTED_WITH, "XMLHttpRequest");
         let resp = rb.send().await.map_err(|e| Error::Transport(format!("{path}: {e}")))?;
         Self::check_status(path, resp)
             .await?
@@ -170,10 +176,13 @@ impl WillysHttp {
         body: &B,
     ) -> Result<T> {
         self.throttle();
-        let rb = Self::browser_headers(self.http.post(format!("{}{}", ep::BASE, path)))
-            .header(ep::REQUESTED_WITH, "XMLHttpRequest")
-            .header(ep::CSRF_HEADER, csrf)
-            .json(body);
+        let rb = Self::browser_headers(
+            self.http.post(format!("{}{}", self.chain.base(), path)),
+            self.chain.base(),
+        )
+        .header(ep::REQUESTED_WITH, "XMLHttpRequest")
+        .header(ep::CSRF_HEADER, csrf)
+        .json(body);
         let resp = rb.send().await.map_err(|e| Error::Transport(format!("{path}: {e}")))?;
         Self::check_status(path, resp)
             .await?
@@ -187,8 +196,11 @@ impl WillysHttp {
     pub fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
         self.throttle();
         let s = self.session.as_ref().ok_or(Error::NotAuthenticated("willys"))?;
-        let mut rb = Self::browser_headers(self.http.request(method, format!("{}{}", ep::BASE, path)))
-            .header(ep::REQUESTED_WITH, "XMLHttpRequest");
+        let mut rb = Self::browser_headers(
+            self.http.request(method, format!("{}{}", self.chain.base(), path)),
+            self.chain.base(),
+        )
+        .header(ep::REQUESTED_WITH, "XMLHttpRequest");
         if let Some(t) = &s.csrf_token {
             rb = rb.header(ep::CSRF_HEADER, t);
         }

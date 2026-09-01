@@ -1,12 +1,14 @@
+use crate::chain::Chain;
 use chrono::{DateTime, Utc};
-use kvitto_core::{Error, ProfileId, Result, SessionStore, StoredSession, WILLYS};
+use kvitto_core::{Error, ProfileId, Result, SessionStore, StoredSession};
 use serde::{Deserialize, Serialize};
 
-/// Everything needed to resume a logged-in Willys session without BankID.
+/// Everything needed to resume a logged-in Axfood (Willys/Hemköp) session
+/// without BankID.
 ///
 /// Held in memory only — see `MemorySessionStore` in kvitto-core for why.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WillysSession {
+pub struct AxfoodSession {
     pub cookies: Vec<Cookie>,
     pub csrf_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -32,7 +34,7 @@ impl Cookie {
     }
 }
 
-impl WillysSession {
+impl AxfoodSession {
     pub fn cookie_header(&self) -> String {
         self.cookies.iter().map(Cookie::header_pair).collect::<Vec<_>>().join("; ")
     }
@@ -44,17 +46,17 @@ impl WillysSession {
         }
     }
 
-    pub fn load(store: &dyn SessionStore, profile: &ProfileId) -> Result<Option<Self>> {
-        match store.load(profile, WILLYS)? {
+    pub fn load(store: &dyn SessionStore, profile: &ProfileId, chain: Chain) -> Result<Option<Self>> {
+        match store.load(profile, chain.source_id())? {
             Some(s) if s.is_live() => Ok(Some(serde_json::from_value(s.blob)?)),
             _ => Ok(None),
         }
     }
 
-    pub fn save(&self, store: &dyn SessionStore, profile: &ProfileId) -> Result<()> {
+    pub fn save(&self, store: &dyn SessionStore, profile: &ProfileId, chain: Chain) -> Result<()> {
         store.save(&StoredSession {
             profile: profile.clone(),
-            source: WILLYS.to_string(),
+            source: chain.source_id().to_string(),
             saved_at: Utc::now(),
             expires_at: self.expires_at,
             blob: serde_json::to_value(self).map_err(Error::from)?,

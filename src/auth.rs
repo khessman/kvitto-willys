@@ -20,16 +20,16 @@
 //!      for a fresh QR payload each tick (response shape unconfirmed)
 //!   4. poll BANKID_COLLECT {orderRef, rememberMe} every ~2s
 //!      -> {status: "PENDING", hintCode} | {status: "COMPLETE", ssn}
-//!   5. on COMPLETE, harvest cookies + csrf token into a WillysSession
+//!   5. on COMPLETE, harvest cookies + csrf token into a AxfoodSession
 //!
 //! Willys does not hand out `qrStartToken`/`qrStartSecret` the way Kivra
 //! does, so the animated-QR HMAC helper from kvitto-ica does not apply here
 //! — BANKID_QR is Willys' own server-computed equivalent. `status` and
 //! `hintCode` are upper/camel-case, unlike BankID's own collect API.
 
-use crate::client::WillysHttp;
+use crate::client::AxfoodHttp;
 use crate::endpoints as ep;
-use crate::session::WillysSession;
+use crate::session::AxfoodSession;
 use kvitto_core::{AuthPrompt, AuthUi, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -98,14 +98,14 @@ pub fn hint_text(code: &str) -> &'static str {
 }
 
 pub struct BankIdLogin<'a> {
-    pub http: &'a WillysHttp,
+    pub http: &'a AxfoodHttp,
     /// Where BankID sends the browser after signing. Point it at the dashboard
     /// so a phone lands back on the progress view instead of a blank tab.
     pub return_url: Option<String>,
 }
 
 impl<'a> BankIdLogin<'a> {
-    pub async fn run(&self, ui: &dyn AuthUi) -> Result<WillysSession> {
+    pub async fn run(&self, ui: &dyn AuthUi) -> Result<AxfoodSession> {
         self.http.warm_up().await?;
         // The real login page fetches these right before `bankid/auth` — in
         // particular `cart` attaches an anonymous cart to the session.
@@ -183,9 +183,9 @@ impl<'a> BankIdLogin<'a> {
     }
 
     /// Harvest cookies and the CSRF token from the completed session.
-    async fn finish(&self, csrf: String, c: CollectResponse) -> Result<WillysSession> {
+    async fn finish(&self, csrf: String, c: CollectResponse) -> Result<AxfoodSession> {
         let cookies = self.http.session_cookies();
-        Ok(WillysSession {
+        Ok(AxfoodSession {
             cookies,
             csrf_token: Some(csrf),
             // Unknown whether Willys offers a longer-lived session; treat it
